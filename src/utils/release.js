@@ -1,18 +1,31 @@
 // 知识变更影响评估与发布门禁：状态常量、统一治理状态机、门禁/发布判定、影响项状态、权限判定与留痕工具（均为纯函数，便于测试）
 // 流程：编辑者保存新版本后发起门禁 →
 // 统一治理状态机先对四个维度做准入检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）：
-//   全部通过 → 待负责人确认影响（pending_confirm）；存在阻断 → blocked，阻断原因回写门禁单与关联实体，
+//   全部通过 → 待影响确认（pending_confirm）；存在阻断 → blocked，阻断原因回写门禁单与关联实体，
 //   责任人可在外部处置后「重新评估」（硬阻断须消除），或对可豁免维度由对应角色跨角色「豁免放行」；
-// 负责人（文档拥有者）逐项确认影响并整体确认 → 管理员审批放行（released：版本发布、引用与链接状态回写）
+// 影响确认环节为「可配置影响确认流」（见 utils/impactFlow）：
+//   按门禁提交时物化的 flow 配置确定确认范围（问答引用/缺口工单/共享链接）、确认人集合与法定人数——
+//   合格确认人逐项确认影响后整体「签署」，K 名不同确认人签署达成（多人确认）才提交管理员审批；
+//   流转期间持续做版本漂移检测：候选版本落后/发布基线移动（版本级，放行前拦截）与
+//   新增/失效关联（影响级），按漂移策略（自动同步 / 提示待同步 / 阻断放行）处置；
+// 管理员审批放行（released：版本发布、引用与链接状态回写）
 // / 驳回（rejected：退回编辑者）→ 已放行版本可由管理员回退（rolled_back：版本回退、引用/链接状态还原）。
 // 门禁流转中（blocked / pending_confirm / pending_approval）候选版本不对问答/搜索/共享访问暴露，
 // 对外内容一律为门禁发起时锁定的「已发布版」（doc.release.publishedSnapshot）。
-// 驳回/撤回/回退后重新发起门禁时，上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
+// 驳回/撤回/回退后重新发起门禁时，按 flow.autoRestore 恢复上一轮影响确认结论与签署（状态恢复）。
 import { ROLE, isGuestUser } from './permission'
 import { buildTimelineEntry } from './review'
 import { FRESH, isFreshDue, isFreshnessEnabled, isFreshTicketOpen } from './freshness'
 import { GAP } from './gap'
 import { RETIRE, isRetirementActive, isRetirementOpen } from './retirement'
+// 影响项类型/状态与可配置确认流的纯函数实现集中在 impactFlow（避免循环依赖，由本模块统一再导出）
+import {
+  IMPACT, IMPACT_TYPE,
+  isFlowConfirmer, gateFlow,
+  allFlowImpactsConfirmed, flowImpactCounts
+} from './impactFlow'
+
+export { IMPACT, IMPACT_TYPE }
 
 // 门禁单状态
 export const GATE = {
@@ -56,20 +69,7 @@ export const CHECK_DEF = {
   [CHECK_KEY.RETIRE]: { label: '退役关系', severity: CHECK_SEVERITY.HARD, roles: [ROLE.ADMIN, 'owner'] }
 }
 
-// 影响项类型
-export const IMPACT_TYPE = {
-  CITATION: 'citation', // 问答引用：本问题的检索结果将受本次版本变更影响
-  TICKET: 'ticket', // 缺口工单：以该文档为答案来源/关联文档
-  SHARE: 'share' // 共享链接：访客/成员凭链接访问本文档
-}
-
-// 影响项状态（随门禁流转回写；rejected/withdrawn/rollback 后影响项回到门禁前状态）
-export const IMPACT = {
-  PENDING: 'pending', // 待负责人确认
-  CONFIRMED: 'confirmed', // 负责人已确认该影响可接受
-  RELEASED: 'released', // 门禁放行后已生效（引用切新版 / 链接同步 / 工单来源已指向新版）
-  REVERTED: 'reverted' // 门禁回退后已还原到门禁前状态
-}
+// 影响项类型/状态常量见 utils/impactFlow（IMPACT_TYPE / IMPACT，含 missing 失效态），本模块顶部已再导出
 
 export function gateStatusLabel(status) {
   return {
@@ -117,7 +117,13 @@ export function impactTypeLabel(type) {
 }
 
 export function impactStatusLabel(status) {
-  return { pending: '待确认', confirmed: '已确认', released: '已随版本发布', reverted: '已随回退还原' }[status] || status
+  return {
+    pending: '待确认',
+    confirmed: '已确认',
+    released: '已随版本发布',
+    reverted: '已随回退还原',
+    missing: '关联已失效'
+  }[status] || status
 }
 
 // ---- 门禁流转判定 ----
@@ -459,11 +465,11 @@ export function canSubmitGate(doc, ctx = {}) {
   return ctx.canEditDoc === true
 }
 
-// 负责人确认影响：文档拥有者本人或管理员；门禁须处于「待负责人确认」（阻断态不可确认）
+// 影响确认（逐项/整体签署）资格：门禁须处于「待影响确认」（阻断态不可确认）；
+// 具体确认人由门禁发起时物化的 flow 配置决定（文档负责人/编辑者/提交人/指定成员，管理员兜底）。
 export function canConfirmGate(gate, doc, userId, role) {
   if (!isGatePendingConfirm(gate) || isGuestUser(userId)) return false
-  if (role === ROLE.ADMIN) return true
-  return !!doc && doc.ownerId === userId
+  return isFlowConfirmer(gateFlow(gate), gate, doc, userId, role)
 }
 
 // 编辑者撤回门禁：发起人本人（或管理员）；门禁仍在流转中（阻断/确认前/待审批均可撤回）
@@ -574,9 +580,10 @@ export function markImpactConfirmed(impacts, key, userId, now) {
   )
 }
 
-// 是否全部影响项均已确认（无影响项时视为确认就绪——允许「无关联影响」的门禁直接确认）
+// 是否全部影响项均已确认（无影响项时视为确认就绪——允许「无关联影响」的门禁直接确认；
+// 漂移导致的失效项 missing 不阻塞：实体已不在联动范围）。实现见 impactFlow。
 export function allImpactsConfirmed(impacts) {
-  return (impacts || []).every((it) => it.status === IMPACT.CONFIRMED || it.status === IMPACT.RELEASED)
+  return allFlowImpactsConfirmed(impacts)
 }
 
 // 放行时影响项批量置为已生效
@@ -610,16 +617,9 @@ export function restoreConfirmedImpacts(impacts, prevImpacts, fromGateId) {
   })
 }
 
-// 影响项计数
+// 影响项计数（含漂移失效项）。实现见 impactFlow
 export function impactCounts(impacts) {
-  const c = { total: (impacts || []).length, citation: 0, ticket: 0, share: 0, confirmed: 0 }
-  for (const it of impacts || []) {
-    if (it.type === IMPACT_TYPE.CITATION) c.citation++
-    if (it.type === IMPACT_TYPE.TICKET) c.ticket++
-    if (it.type === IMPACT_TYPE.SHARE) c.share++
-    if (it.status === IMPACT.CONFIRMED || it.status === IMPACT.RELEASED) c.confirmed++
-  }
-  return c
+  return flowImpactCounts(impacts)
 }
 
 // ---- 问答引用影响推荐（提交门禁时自动勾选）----
@@ -671,6 +671,13 @@ export function gateTimelineLabel(action) {
     'impact-restore': '重新发起 · 恢复上轮已确认影响',
     'impact-confirm-item': '逐项确认影响',
     'impact-confirm-all': '整体确认影响',
+    // 可配置影响确认流：多人签署 / 版本漂移
+    'flow-signoff': '确认人签署影响结论',
+    'flow-signoff-withdraw': '确认人撤回签署',
+    'flow-quorum': '法定人数达成 · 提交管理员审批',
+    'drift-detected': '检测到版本漂移',
+    'drift-sync': '同步漂移影响项',
+    'drift-bounce': '放行前漂移未同步 · 退回影响确认',
     approve: '管理员审批放行',
     'approve-stale': '放行被阻止：候选版本已落后于最新版本',
     reject: '管理员审批驳回',

@@ -201,7 +201,7 @@ export const useKbStore = defineStore('kb', () => {
   async function deleteDoc(id, currentUser) {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'ok' }
-    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, async () => {
+    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, db.gateFlowPolicies, async () => {
       const doc = await db.docs.get(id)
       if (!doc) { result = { status: 'missing' }; return }
       const pendingReview = await db.reviews

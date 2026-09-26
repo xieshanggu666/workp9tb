@@ -14,6 +14,12 @@ import {
   allChecksCleared, blockingReasons, buildGateEntry,
   isCandidateStale, rollbackConflictReason
 } from '@/utils/release'
+import {
+  DRIFT_POLICY, FLOW_SCOPE_KIND, docFlowScope,
+  normalizeFlowConfig, resolveFlowConfig, gateFlow, flowConfigSummary,
+  isFlowConfirmer, flowQuorum, quorumMet, addSignoff, removeSignoff,
+  detectGateDrift, mergeDriftImpacts, restorableSignoffs, hasFlowConfirmer
+} from '@/utils/impactFlow'
 import { canEditDoc, GUEST_ID, ROLE } from '@/utils/permission'
 import { isGrantActive, ACCESS_PERM } from '@/utils/access'
 import { shareStatus } from '@/utils/share'
@@ -23,23 +29,30 @@ import { GAP } from '@/utils/gap'
 import { isRetirementOpen, isRetirementActive } from '@/utils/retirement'
 import { useKbStore } from './kb'
 
-// 知识变更影响评估与发布门禁 store（统一治理状态机）：
+// 知识变更影响评估与发布门禁 store（统一治理状态机 + 可配置影响确认流）：
 // 编辑者保存新版本后「提交发布门禁」（submitGate）：
-//   同事务锁定候选版本、把文档对外内容回退到门禁前已发布快照、自动关联受影响的
+//   同事务锁定候选版本、把文档对外内容回退到门禁前已发布快照、解析影响确认流配置
+//   （文档级覆盖 > 全局 > 内置默认，物化快照到 gate.flow），按确认范围自动关联受影响的
 //   问答引用（qaCitations 命中记录）、缺口工单（gapTickets 关联/来源为本文档）与共享链接（shares），
 //   并对四个治理维度做准入检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）：
 //   全部通过 → pending_confirm；存在阻断 → blocked，阻断原因回写门禁单与关联实体时间线；
 // 责任人在外部处置阻断后「重新评估」（recheckGate：硬阻断须消除），或对软阻断维度
 //   由对应责任角色「豁免」（signOffCheck：保鲜→负责人/管理员，缺口→编辑者/管理员）；
-//   全部维度通过后进入 pending_confirm（负责人逐项确认影响）→ pending_approval；
-// 管理员审批放行（decideGate approve；放行前再次复检，阻断若复现则退回 blocked）：候选快照回写文档、
-//   追加发布版本标记、问答引用切换到新版、共享链接状态同步；
+//   全部维度通过后进入 pending_confirm；
+// 影响确认按 flow 配置进行多人签署（confirmGate）：合格确认人逐项确认影响后整体签署，
+//   达到法定人数（quorum）才进入 pending_approval；签署可撤回（withdrawSignoff，未达成前）；
+//   确认/同步时做版本漂移检测（detectGateDrift）：候选版本落后、发布基线移动、关联新增/失效——
+//   按 flow.driftPolicy 自动合并（auto）、提示手动同步（notify，syncGateDrift）或放行前退回（block）；
+// 管理员审批放行（decideGate approve；放行前再次复检准入维度与候选新鲜度，阻断若复现则退回 blocked）：
+//   候选快照回写文档、追加发布版本标记、问答引用切换到新版、共享链接状态同步；
 //   驳回（reject）/编辑者撤回（withdraw）：版本不发布，文档保持已发布版；
 // 已放行版本管理员可回退（rollbackGate）：正文与问答引用恢复到发布前版本、链接状态还原。
-// 驳回/撤回/回退后重新发起门禁：上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
-// 全程在门禁单 timeline、版本记录门禁标记与各影响实体上留痕。
+// 驳回/撤回/回退后重新发起门禁：按 flow.autoRestore 恢复上一轮影响确认结论与整体签署（状态恢复）。
+// 确认流配置变更（saveFlowPolicy/clearFlowPolicy）写入策略 history；
+// 全程在门禁单 timeline、版本记录门禁标记与各影响实体上留痕，历史门禁按物化配置快照解读（留痕一致）。
 export const useReleaseStore = defineStore('release', () => {
   const gates = ref([])
+  const policies = ref([]) // 影响确认流配置（gateFlowPolicies：global / doc:<id>）
   const loaded = ref(false)
 
   async function loadAll() {
@@ -49,7 +62,9 @@ export const useReleaseStore = defineStore('release', () => {
   }
 
   async function reload() {
-    gates.value = await db.releaseGates.toArray()
+    const [g, p] = await Promise.all([db.releaseGates.toArray(), db.gateFlowPolicies.toArray()])
+    gates.value = g
+    policies.value = p
   }
 
   const sorted = computed(() =>
@@ -89,11 +104,11 @@ export const useReleaseStore = defineStore('release', () => {
     })
   }
 
-  // 待我确认影响（文档拥有者视角；管理员也可确认）
+  // 待我确认影响：按各门禁物化的 flow 配置判定确认资格（负责人/编辑者/提交人/指定成员，管理员兜底）
   function pendingConfirmFor(userId, role) {
     return sorted.value.filter((g) => {
       if (g.status !== GATE.PENDING_CONFIRM) return false
-      return role === ROLE.ADMIN || g.ownerId === userId
+      return isFlowConfirmer(gateFlow(g), g, null, userId, role)
     })
   }
 
@@ -112,6 +127,91 @@ export const useReleaseStore = defineStore('release', () => {
     return blockedFor(userId, role).length
       + pendingConfirmFor(userId, role).length
       + (role === ROLE.ADMIN ? pendingApprovalFor(role).length : 0)
+  }
+
+  // ---- 影响确认流配置（全局默认 / 文档级覆盖）----
+
+  function flowPolicyOf(scope) {
+    return policies.value.find((p) => p.scope === scope) || null
+  }
+
+  // 解析某文档当前生效的确认流配置：{ config, source: 'default'|'global'|'doc', policyId }
+  function resolveFlowForDoc(docId) {
+    return resolveFlowConfig(docId ? { id: docId } : null, policies.value)
+  }
+
+  // 保存确认流配置。scope: 'global'（仅管理员）| 'doc:<id>'（文档负责人或管理员）。
+  // 每次变更追加 history 留痕；在途/历史门禁不受影响（按各自物化的 flow 快照流转）。
+  // 返回 { status:'ok', policy } | 'guest' | 'denied' | 'missing' | 'empty-confirmers'
+  async function saveFlowPolicy({ scope, config }, currentUser) {
+    const kb = useKbStore()
+    await kb.loadAll()
+    await loadAll()
+    const now = new Date().toISOString()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    if (userId === GUEST_ID) return { status: 'guest' }
+    const normalized = normalizeFlowConfig(config || {})
+    if (!hasFlowConfirmer(normalized)) return { status: 'empty-confirmers' }
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.gateFlowPolicies, db.docs, async () => {
+      let doc = null
+      if (scope === FLOW_SCOPE_KIND.GLOBAL) {
+        if (role !== ROLE.ADMIN) { result = { status: 'denied' }; return }
+      } else if (typeof scope === 'string' && scope.startsWith(FLOW_SCOPE_KIND.DOC_PREFIX)) {
+        const docId = scope.slice(FLOW_SCOPE_KIND.DOC_PREFIX.length)
+        doc = await db.docs.get(docId)
+        if (!doc) { result = { status: 'missing' }; return }
+        if (role !== ROLE.ADMIN && doc.ownerId !== userId) { result = { status: 'denied' }; return }
+      } else {
+        result = { status: 'denied' }
+        return
+      }
+      const existing = await db.gateFlowPolicies.where('scope').equals(scope).first()
+      const summary = flowConfigSummary(normalized)
+      const entry = { action: 'flow-config', by: userId, note: summary, at: now }
+      const policy = existing
+        ? { ...existing, config: normalized, updatedBy: userId, updatedAt: now, history: [...(existing.history || []), entry].slice(-50) }
+        : { id: uid('gfp'), scope, config: normalized, updatedBy: userId, updatedAt: now, history: [entry] }
+      await db.gateFlowPolicies.put(policy)
+      result = { status: 'ok', policy }
+    })
+
+    await reload()
+    return result
+  }
+
+  // 清除自定义配置（文档级回落全局/默认；全局回落内置默认）。权限同保存。
+  async function clearFlowPolicy({ scope }, currentUser) {
+    const kb = useKbStore()
+    await kb.loadAll()
+    await loadAll()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    if (userId === GUEST_ID) return { status: 'guest' }
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.gateFlowPolicies, db.docs, async () => {
+      if (scope === FLOW_SCOPE_KIND.GLOBAL) {
+        if (role !== ROLE.ADMIN) { result = { status: 'denied' }; return }
+      } else if (typeof scope === 'string' && scope.startsWith(FLOW_SCOPE_KIND.DOC_PREFIX)) {
+        const docId = scope.slice(FLOW_SCOPE_KIND.DOC_PREFIX.length)
+        const doc = await db.docs.get(docId)
+        if (!doc) { result = { status: 'missing' }; return }
+        if (role !== ROLE.ADMIN && doc.ownerId !== userId) { result = { status: 'denied' }; return }
+      } else {
+        result = { status: 'denied' }
+        return
+      }
+      const existing = await db.gateFlowPolicies.where('scope').equals(scope).first()
+      if (!existing) { result = { status: 'no-policy' }; return }
+      await db.gateFlowPolicies.delete(existing.id)
+      result = { status: 'ok' }
+    })
+
+    await reload()
+    return result
   }
 
   // 问答产生引用时记录（QAAssistant 提问后调用）：每条命中一条，便于门禁关联受影响引用。
@@ -231,7 +331,7 @@ export const useReleaseStore = defineStore('release', () => {
     await db.transaction(
       'rw',
       db.docs, db.releaseGates, db.reviews, db.accessRequests, db.shares, db.gapTickets, db.qaCitations,
-      db.handovers, db.freshnessTickets, db.retirements,
+      db.handovers, db.freshnessTickets, db.retirements, db.gateFlowPolicies,
       async () => {
         const doc = await db.docs.get(payload.docId)
         if (!doc) { result = { status: 'missing' }; return }
@@ -281,7 +381,12 @@ export const useReleaseStore = defineStore('release', () => {
         }
 
         // 自动收集影响项（问答引用 / 缺口工单 / 共享链接）
-        const auto = await collectImpactsTx(doc.id, doc)
+        const autoAll = await collectImpactsTx(doc.id, doc)
+        // 影响确认流配置：文档级覆盖 > 全局配置 > 内置默认（物化快照，历史单不受后续配置变更影响）
+        const flowPolicies = await db.gateFlowPolicies.toArray()
+        const resolvedFlow = resolveFlowConfig(doc, flowPolicies)
+        const flow = resolvedFlow.config
+        const auto = autoAll.filter((it) => flow.scope.includes(it.type))
         // 调用方显式勾选/取消时按类型 refId 过滤；未传则全部采用自动结果
         let impacts = auto
         const picks = {
@@ -304,20 +409,30 @@ export const useReleaseStore = defineStore('release', () => {
           : c))
         const blocked = !allChecksCleared(checks)
 
-        // 状态恢复：上一轮门禁（驳回/撤回/回退）中已逐项确认的影响自动恢复确认态
+        // 状态恢复：上一轮门禁（驳回/撤回/回退）中已逐项确认的影响自动恢复确认态；
+        // 按 flow.autoRestore 决定是否恢复（关闭时只恢复影响项结论？——不，两者统一由 flow 控制，
+        // 关闭 autoRestore 时上轮签署与确认结论均不沿用，须当轮重新确认）
         const prevGate = (await db.releaseGates.where('docId').equals(doc.id).toArray())
           .filter((g) => [GATE.REJECTED, GATE.WITHDRAWN, GATE.ROLLED_BACK].includes(g.status))
           .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0]
         let restoredCount = 0
-        if (prevGate) {
+        let signoffs = []
+        if (prevGate && flow.autoRestore) {
           impacts = restoreConfirmedImpacts(impacts, prevGate.impacts, prevGate.id)
           restoredCount = impacts.filter((it) => it.restoredFromGateId === prevGate.id).length
+          signoffs = restorableSignoffs(prevGate, flow).map((s) => ({ ...s, restoredAt: now }))
         }
+        const restoredSignoffCount = signoffs.length
 
         const publishedVersion = doc.release?.publishedVersion ?? (candidateVersion - 1)
         const timeline = [buildGateEntry('submit', userId, payload.note || ('v' + candidateVersion + ' 提交发布门禁，待准入检查与影响确认'), now)]
-        if (restoredCount > 0) {
-          timeline.push(buildGateEntry('impact-restore', 'system', '恢复上轮门禁中已确认的 ' + restoredCount + ' 项影响（沿用上轮确认结论）', now))
+        if (restoredCount > 0 || restoredSignoffCount > 0) {
+          timeline.push(buildGateEntry(
+            'impact-restore', 'system',
+            '恢复上轮门禁中已确认的 ' + restoredCount + ' 项影响'
+              + (restoredSignoffCount ? '、' + restoredSignoffCount + ' 名确认人签署（沿用上轮结论）' : ''),
+            now
+          ))
         }
         if (blocked) {
           const reasons = checks.filter((c) => c.status === CHECK_STATUS.BLOCKED)
@@ -336,9 +451,14 @@ export const useReleaseStore = defineStore('release', () => {
           note: String(payload.note || '').trim(),
           checks,
           impacts,
+          // 可配置影响确认流：发起时物化的配置快照与多人签署（历史单按当轮配置解读）
+          flow,
+          flowSource: resolvedFlow.source,
+          signoffs,
+          drift: null,
           candidateSnapshot: { ...candidateSnap, tagIds: [...(candidateSnap.tagIds || [])] },
           publishedSnapshot: published,
-          restoredFromGateId: restoredCount > 0 ? prevGate.id : null,
+          restoredFromGateId: (restoredCount > 0 || restoredSignoffCount > 0) ? prevGate.id : null,
           confirmedBy: null,
           confirmedAt: null,
           decidedBy: null,
@@ -526,8 +646,52 @@ export const useReleaseStore = defineStore('release', () => {
     return result
   }
 
-  // 负责人整体确认影响 → 待管理员审批（要求全部影响项已逐项确认；无影响项可直接确认）
+  // 整体确认（兼容入口）：等价于一次多人签署 signoffGate。
+  // 单人确认流（flow.quorum=1，默认）签署即提交管理员审批；多人确认流需各确认人分别调用，
+  // 达到法定人数后才提交。建议 UI 使用 signoffGate 以取得 signed/required 进度。
   async function confirmGate(gateId, note, currentUser) {
+    return signoffGate(gateId, note, currentUser)
+  }
+
+  // ---- 可配置影响确认流：版本漂移检测与多人签署 ----
+
+  // 事务内实时收集确认范围内的影响项（漂移检测用；collectImpactsTx 始终收集全量，这里按 flow 过滤）
+  async function collectScopedImpactsTx(gate, doc) {
+    const flow = gateFlow(gate)
+    const all = await collectImpactsTx(gate.docId, doc)
+    return all.filter((it) => flow.scope.includes(it.type))
+  }
+
+  // 事务内版本漂移检测：版本级（候选落后/基线移动）+ 影响级（新增/失效/恢复关联）
+  async function detectDriftTx(gate, doc) {
+    const collected = await collectScopedImpactsTx(gate, doc)
+    return detectGateDrift(gate, {
+      latestVersion: ensureVersions(doc, new Date().toISOString()).length,
+      publishedVersion: doc?.release?.publishedVersion ?? null,
+      collected
+    })
+  }
+
+  // 漂移检测结果 → 留痕文案
+  function driftNote(drift) {
+    const parts = []
+    for (const it of drift.items || []) {
+      if (it.kind === 'candidate-stale') parts.push('候选 v' + it.candidateVersion + ' 已落后于最新 v' + it.latestVersion)
+      else if (it.kind === 'baseline-moved') parts.push('发布基线已变为 v' + it.publishedVersion)
+      else if (it.kind === 'impacts-added') parts.push('新增受影响关联 ' + it.count + ' 项')
+      else if (it.kind === 'impacts-removed') parts.push('已失效关联 ' + it.count + ' 项')
+      else if (it.kind === 'impacts-revived') parts.push('恢复生效关联 ' + it.count + ' 项')
+    }
+    return parts.join('；')
+  }
+
+  // 合格确认人整体签署影响结论（多人确认）：
+  // 签署前做版本漂移检测——影响级漂移按 flow.driftPolicy 处理：
+  //   auto   自动合并新增/失效影响项并留痕（新项须逐项确认，故可能返回 unconfirmed）；
+  //   notify 记录漂移快照并返回 'drift'，须确认人先 syncGateDrift 手动同步；
+  //   block  同 notify（在确认环节先同步；放行前还会再检一次并退回）。
+  // 全部影响项就绪后追加签署；不同签署人数达到 flow.quorum 才进入待管理员审批。
+  async function signoffGate(gateId, note, currentUser) {
     const kb = useKbStore()
     await loadAll()
     const now = new Date().toISOString()
@@ -535,31 +699,154 @@ export const useReleaseStore = defineStore('release', () => {
     const role = currentUser?.role || null
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.releaseGates, db.docs, async () => {
-      const gate = await db.releaseGates.get(gateId)
-      if (!gate) { result = { status: 'missing' }; return }
-      const doc = await db.docs.get(gate.docId)
-      if (!canConfirmGate(gate, doc, userId, role)) { result = { status: 'denied' }; return }
-      if (!allImpactsConfirmed(gate.impacts)) { result = { status: 'unconfirmed' }; return }
-      const confirmed = {
-        ...gate,
-        status: GATE.PENDING_APPROVAL,
-        confirmedBy: userId,
-        confirmedAt: now,
-        timeline: [...(gate.timeline || []), buildGateEntry('impact-confirm-all', userId, note || '负责人已确认全部影响，提交管理员审批', now)]
+    await db.transaction(
+      'rw',
+      db.releaseGates, db.docs, db.qaCitations, db.gapTickets, db.shares,
+      async () => {
+        const gate0 = await db.releaseGates.get(gateId)
+        if (!gate0) { result = { status: 'missing' }; return }
+        const doc = await db.docs.get(gate0.docId)
+        if (!canConfirmGate(gate0, doc, userId, role)) {
+          result = userId === GUEST_ID ? { status: 'guest' } : { status: 'denied' }
+          return
+        }
+        const flow = gateFlow(gate0)
+        let gate = gate0
+        const timeline = [...(gate0.timeline || [])]
+
+        // 版本漂移检测：影响级漂移按策略处理（版本级漂移由放行时的 stale 校验兜底拦截）
+        const drift = await detectDriftTx(gate0, doc)
+        if (drift.hasImpactDrift) {
+          if (flow.driftPolicy === DRIFT_POLICY.AUTO) {
+            const collected = await collectScopedImpactsTx(gate0, doc)
+            const merged = mergeDriftImpacts(gate0.impacts, collected, now)
+            timeline.push(buildGateEntry('drift-detected', 'system', driftNote(drift), now))
+            timeline.push(
+              buildGateEntry('drift-sync', userId,
+                '自动同步影响项：新增 ' + merged.added + ' · 失效 ' + merged.removed + (merged.revived ? ' · 恢复 ' + merged.revived : ''), now)
+            )
+            gate = { ...gate0, impacts: merged.impacts, drift: null, timeline }
+          } else {
+            // 提示待同步 / 阻断放行：先记录漂移快照，同步后再签署（状态保持待影响确认）
+            const flagged = {
+              ...gate0,
+              drift: { ...drift, detectedAt: now, policy: flow.driftPolicy },
+              timeline: [...timeline, buildGateEntry('drift-detected', 'system', driftNote(drift) + '（按确认流策略须先「同步影响项」再签署）', now)]
+            }
+            await db.releaseGates.put(flagged)
+            result = { status: 'drift', gate: flagged, drift }
+            return
+          }
+        }
+
+        // 漂移新增项为待确认：须逐项确认后才能签署
+        if (!allImpactsConfirmed(gate.impacts)) {
+          if (gate !== gate0) await db.releaseGates.put(gate) // 保留自动同步结果，供逐项确认
+          result = { status: 'unconfirmed', gate }
+          return
+        }
+
+        // 追加本次签署（同一确认人重复签署刷新其时间/意见，不重复计数）
+        const signoffs = addSignoff(gate.signoffs || [], {
+          by: userId,
+          role,
+          note: String(note || '').trim(),
+          at: now,
+          restoredFromGateId: (gate.signoffs || []).find((s) => s.by === userId)?.restoredFromGateId || null
+        })
+        const required = flowQuorum(flow)
+        const signed = signoffs.length
+        timeline.push(buildGateEntry('flow-signoff', userId,
+          String(note || '').trim() || ('确认人签署影响结论（' + signed + '/' + required + '）'), now))
+        const met = quorumMet(signoffs, flow)
+        const signedGate = {
+          ...gate,
+          signoffs,
+          status: met ? GATE.PENDING_APPROVAL : GATE.PENDING_CONFIRM,
+          confirmedBy: met ? userId : gate.confirmedBy,
+          confirmedAt: met ? now : gate.confirmedAt,
+          timeline: met
+            ? [...timeline, buildGateEntry('flow-quorum', 'system', '法定人数 ' + required + ' 已达成，提交管理员审批', now)]
+            : timeline
+        }
+        await db.releaseGates.put(signedGate)
+
+        // 版本门禁标记随状态推进
+        if (doc) {
+          const versions = (doc.versions || []).map((v) =>
+            v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status: signedGate.status, at: now } } : v
+          )
+          await db.docs.update(doc.id, { versions })
+        }
+        result = { status: 'ok', gate: signedGate, met, signed, required }
       }
-      await db.releaseGates.put(confirmed)
-      // 版本门禁标记推进到待审批
-      if (doc) {
-        const versions = (doc.versions || []).map((v) =>
-          v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status: GATE.PENDING_APPROVAL, at: now } } : v
-        )
-        await db.docs.update(doc.id, { versions })
-      }
-      result = { status: 'ok', gate: confirmed }
-    })
+    )
 
     await Promise.all([reload(), kb.reloadDocs()])
+    return result
+  }
+
+  // 手动同步漂移影响项（notify/block 策略，或确认人主动复核）：
+  // 新增关联列为待确认、失效关联标 missing（保留留痕）、恢复项重新待确认，并清除门禁漂移快照。
+  // 仅待影响确认态可同步；本门禁合格确认人、提交人或管理员可操作。
+  async function syncGateDrift(gateId, currentUser) {
+    const kb = useKbStore()
+    await loadAll()
+    const now = new Date().toISOString()
+    const userId = currentUser?.id || GUEST_ID
+    const role = currentUser?.role || null
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.releaseGates, db.docs, db.qaCitations, db.gapTickets, db.shares, async () => {
+      const gate = await db.releaseGates.get(gateId)
+      if (!gate) { result = { status: 'missing' }; return }
+      if (gate.status !== GATE.PENDING_CONFIRM) { result = { status: 'changed' }; return }
+      const doc = await db.docs.get(gate.docId)
+      const eligible = isFlowConfirmer(gateFlow(gate), gate, doc, userId, role) || gate.submittedBy === userId
+      if (!eligible) { result = userId === GUEST_ID ? { status: 'guest' } : { status: 'denied' }; return }
+      const collected = await collectScopedImpactsTx(gate, doc)
+      const merged = mergeDriftImpacts(gate.impacts, collected, now)
+      const synced = {
+        ...gate,
+        impacts: merged.impacts,
+        drift: null,
+        timeline: [
+          ...(gate.timeline || []),
+          buildGateEntry('drift-sync', userId,
+            '同步影响项：新增 ' + merged.added + ' · 失效 ' + merged.removed + (merged.revived ? ' · 恢复 ' + merged.revived : ''), now)
+        ]
+      }
+      await db.releaseGates.put(synced)
+      result = { status: 'ok', gate: synced, added: merged.added, removed: merged.removed, revived: merged.revived }
+    })
+
+    await reload()
+    return result
+  }
+
+  // 确认人撤回本人整体签署（仅法定人数尚未达成、门禁仍待影响确认时；达成后须由管理员驳回）
+  async function withdrawSignoff(gateId, currentUser) {
+    await loadAll()
+    const now = new Date().toISOString()
+    const userId = currentUser?.id || GUEST_ID
+    let result = { status: 'error' }
+
+    await db.transaction('rw', db.releaseGates, async () => {
+      const gate = await db.releaseGates.get(gateId)
+      if (!gate) { result = { status: 'missing' }; return }
+      if (gate.status !== GATE.PENDING_CONFIRM) { result = { status: 'changed' }; return }
+      if (!(gate.signoffs || []).some((s) => s.by === userId)) { result = { status: 'not-signed' }; return }
+      const signoffs = removeSignoff(gate.signoffs || [], userId)
+      const updated = {
+        ...gate,
+        signoffs,
+        timeline: [...(gate.timeline || []), buildGateEntry('flow-signoff-withdraw', userId, '', now)]
+      }
+      await db.releaseGates.put(updated)
+      result = { status: 'ok', gate: updated }
+    })
+
+    await reload()
     return result
   }
 
@@ -669,6 +956,33 @@ export const useReleaseStore = defineStore('release', () => {
           await db.docs.update(doc.id, { versions })
           result = { status: 'blocked', gate: bounced, blocking: blockingReasons(bounced) }
           return
+        }
+
+        // ---- 放行前版本漂移复核（仅 block 策略）：待审批期间新增/失效关联未同步 →
+        // 退回影响确认（保留已取得的签署），确认人同步漂移并重签后再送审批；
+        // auto 策略放行时按实时集合联动（下方引用/链接回写本就覆盖门禁期间新增记录）；
+        // notify 策略在签署环节已要求同步。版本级漂移（候选落后）由上方 stale 校验拦截。----
+        if (gateFlow(gate).driftPolicy === DRIFT_POLICY.BLOCK) {
+          const drift = await detectDriftTx(gate, doc)
+          if (drift.hasImpactDrift) {
+            const bounced = {
+              ...gate,
+              status: GATE.PENDING_CONFIRM,
+              drift: { ...drift, detectedAt: now, policy: DRIFT_POLICY.BLOCK },
+              timeline: [
+                ...(gate.timeline || []),
+                buildGateEntry('drift-detected', 'system', driftNote(drift) + '（阻断放行策略）', now),
+                buildGateEntry('drift-bounce', 'system', '放行前检测到未同步的版本漂移，退回影响确认；同步并重新签署后再放行', now)
+              ]
+            }
+            await db.releaseGates.put(bounced)
+            const versions = (doc.versions || []).map((v) =>
+              v.gate?.gateId === gateId ? { ...v, gate: { ...v.gate, status: GATE.PENDING_CONFIRM, at: now } } : v
+            )
+            await db.docs.update(doc.id, { versions })
+            result = { status: 'drift', gate: bounced, drift }
+            return
+          }
         }
 
         // ---- 放行发布：回写候选快照 → 文档对外可见；问答引用切新版；共享链接状态同步 ----
@@ -907,15 +1221,19 @@ export const useReleaseStore = defineStore('release', () => {
         })
       }
     }
+    // 文档级影响确认流配置随文档删除（全局配置保留）
+    await db.gateFlowPolicies.where('scope').equals(docFlowScope(docId)).delete()
   }
 
   return {
-    gates, loaded, loadAll, reload, sorted,
+    gates, policies, loaded, loadAll, reload, sorted,
     openGateOfDoc, gateById, gatesOfDoc,
     blockedFor, pendingConfirmFor, pendingApprovalFor, submittedBy, pendingCountFor,
+    flowPolicyOf, resolveFlowForDoc, saveFlowPolicy, clearFlowPolicy,
     recordCitations, collectImpactsTx,
     submitGate, recheckGate, signOffCheck,
-    confirmImpact, confirmGate, withdrawGate, decideGate, rollbackGate,
+    confirmImpact, confirmGate, signoffGate, withdrawSignoff, syncGateDrift,
+    withdrawGate, decideGate, rollbackGate,
     resetGatesOfDocTx
   }
 })

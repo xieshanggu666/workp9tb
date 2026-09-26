@@ -121,6 +121,16 @@ export class KnowledgeDB extends Dexie {
       releaseGates: 'id, status, docId, submittedBy, ownerId, version, createdAt, confirmedAt, decidedAt',
       qaCitations: 'id, docId, askedBy, createdAt, gateId'
     })
+    // v15：可配置影响确认流（发布门禁的评审/缺口/退役/问答引用联动扩展）
+    // - gateFlowPolicies：影响确认流配置（scope='global' 全局默认 / scope='doc:<id>' 文档级覆盖）。
+    //   可配置：影响确认范围（问答引用/缺口工单/共享链接）、确认人集合（文档负责人/管理员/编辑者/
+    //   提交人/指定成员）与法定人数（多人确认）、版本漂移策略（自动同步 / 提示待同步 / 阻断放行）、
+    //   上轮确认结论与签署是否自动恢复；每次变更追加 history 留痕。
+    // - releaseGates 在提交时物化 flow 配置快照（gate.flow）与 signoffs（多人签署）/drift（漂移快照），
+    //   历史门禁始终按发起当时的配置解读，配置后续变更不回改历史单（历史留痕一致）。
+    this.version(15).stores({
+      gateFlowPolicies: 'id, scope, updatedAt'
+    })
   }
 }
 
