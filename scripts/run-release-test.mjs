@@ -3,7 +3,10 @@
 // 阻断建档（blocked）与阻断原因回写 → 跨角色豁免（负责人豁免保鲜、编辑者豁免缺口）→
 // 硬阻断消除后重新评估 → 负责人逐项确认影响（含重新发起时的确认状态恢复）→
 // 管理员审批放行（版本发布、问答引用切新版、链接状态回写、放行前复检）/ 驳回/撤回 →
-// 管理员回退（正文/引用/链接还原）→ 门禁中编辑锁定、问答/搜索/共享访问只认已发布版、文档删除清理门禁。
+// 管理员回退（正文/引用/链接还原）→ 门禁中编辑锁定、问答/搜索/共享访问只认已发布版、文档删除清理门禁；
+// 可配置影响确认流：策略权限与门禁快照、多人确认（quorum/负责人必签/编辑者签认）、
+// 影响类型开关（免确认类型自动确认且联动保留）、版本漂移检测（确认/放行前重扫合并重置）、
+// 回退恢复（多人签认随重新发起恢复）与历史留痕一致。
 // 运行：npm run test:release
 import 'fake-indexeddb/auto'
 import { createApp } from 'vue'
@@ -21,7 +24,9 @@ import { uid, makeToken } from '@/utils/format'
 import {
   GATE, RELEASE_STATE, CHECK_KEY, CHECK_STATUS, CHECK_SEVERITY,
   publishedSnapshot, isDocGated, evaluateGateChecks, canSignOffCheck, canRecheckGate,
-  rollbackConflictReason, isCandidateStale
+  rollbackConflictReason, isCandidateStale,
+  normalizeImpacts, diffImpacts, mergeDriftedImpacts, DEFAULT_RELEASE_POLICY,
+  gatePolicy, normalizeReleasePolicy
 } from '@/utils/release'
 import { canEditDoc } from '@/utils/permission'
 import { isShareActive } from '@/utils/share'
@@ -669,6 +674,180 @@ assert(staleGateRec.status === GATE.PENDING_APPROVAL, '被阻止的门禁仍停�
 assert(staleGateRec.timeline.some((t) => t.action === 'approve-stale'), '阻止放行的原因写入门禁留痕')
 r = await release.withdrawGate(staleGate.id, owner)
 assert(r.status === 'ok', '撤回落后门禁成功，可基于最新版本重新发起')
+
+// ---------- 15. 可配置影响确认流：策略权限、归一化与门禁快照 ----------
+console.log('\n[15] 可配置影响确认流：策略配置权限与门禁快照（历史一致）')
+assert(normalizeReleasePolicy(null).confirmQuorum === 1 && normalizeReleasePolicy(null).driftReconfirm === true, '未配置策略时回退默认（单人签认 + 漂移检测开）')
+let pr = await release.savePolicy({ confirmQuorum: 3 }, editor)
+assert(pr.status === 'denied', '非管理员不能修改确认流策略')
+pr = await release.savePolicy({ confirmQuorum: 99, requireOwner: true }, admin)
+assert(pr.status === 'ok' && pr.policy.confirmQuorum === 5 && pr.policy.requireOwner === true, '管理员保存策略成功且 quorum 收敛到 1–5')
+assert(release.policy.timeline.some((t) => t.action === 'policy-update'), '策略变更写入策略留痕')
+// 门禁快照：策略后续变更不改写已建档门禁
+const dP = await mkDoc()
+await saveVersion(dP.id, { body: '<p>策略快照 新内容</p>' }, owner)
+await release.savePolicy({ confirmQuorum: 2, requireOwner: false }, admin)
+r = await release.submitGate({ docId: dP.id }, owner)
+const gP = r.gate
+assert(gP.policy && gP.policy.confirmQuorum === 2 && gatePolicy(gP).confirmQuorum === 2, '门禁建档时快照确认流策略')
+await release.savePolicy({ confirmQuorum: 1 }, admin)
+assert(gatePolicy(release.gateById(gP.id)).confirmQuorum === 2, '策略变更不改写历史门禁快照（历史留痕一致）')
+await release.withdrawGate(gP.id, owner)
+
+// ---------- 16. 多人确认：quorum / 负责人必签 / 编辑者签认资格 ----------
+console.log('\n[16] 多人确认：quorum、负责人必签与签认资格')
+await release.savePolicy({ confirmQuorum: 2, requireOwner: true, allowEditorConfirm: false, watchCitation: true, watchTicket: true, watchShare: true, driftReconfirm: true }, admin)
+const dM = await mkDoc({ editors: [owner.id, editor.id] })
+await saveVersion(dM.id, { body: '<p>多人确认 新内容</p>' }, owner)
+await mkCitation(dM.id, '多人确认问题?', 1)
+r = await release.submitGate({ docId: dM.id }, owner)
+const gM = r.gate
+for (const it of gM.impacts) {
+  const rr = await release.confirmImpact(gM.id, it.key, owner)
+  assert(rr.status === 'ok', '负责人逐项确认影响')
+}
+r = await release.confirmGate(gM.id, '', editor)
+assert(r.status === 'denied', '策略未放开时协作编辑者不能签认')
+r = await release.confirmGate(gM.id, '', viewer)
+assert(r.status === 'denied', '只读成员不能签认')
+r = await release.confirmGate(gM.id, '', admin)
+assert(r.status === 'ok' && r.advanced === false && r.gate.status === GATE.PENDING_CONFIRM, '第一人签认后不推进（quorum=2）')
+assert(release.gateById(gM.id).confirmations.length === 1, '签认记录 1 人')
+assert(release.gateById(gM.id).timeline.some((t) => t.action === 'confirm-add'), '签认写入门禁留痕')
+assert(!release.pendingConfirmFor(admin.id, 'admin').some((g) => g.id === gM.id), '已签认者不再计入待确认角标')
+assert(release.pendingConfirmFor(owner.id, 'editor').some((g) => g.id === gM.id), '未签认的负责人仍在待确认角标中')
+r = await release.confirmGate(gM.id, '', admin)
+assert(r.status === 'ok' && r.advanced === false && release.gateById(gM.id).confirmations.length === 1, '重复签认去重不重复计数')
+r = await release.confirmGate(gM.id, '', owner)
+assert(r.status === 'ok' && r.advanced === true && r.gate.status === GATE.PENDING_APPROVAL, '负责人签认后满足 quorum + 负责人必签，推进审批')
+assert(r.gate.confirmedBy === owner.id, 'confirmedBy 记录完成推进的签认人')
+r = await release.decideGate(gM.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '多人确认链路审批放行成功')
+
+// 编辑者签认资格随策略放开
+await release.savePolicy({ confirmQuorum: 2, requireOwner: false, allowEditorConfirm: true }, admin)
+const dM2 = await mkDoc({ editors: [owner.id, editor.id] })
+await saveVersion(dM2.id, { body: '<p>编辑者签认 新内容</p>' }, owner)
+r = await release.submitGate({ docId: dM2.id }, owner)
+const gM2 = r.gate
+r = await release.confirmGate(gM2.id, '', editor)
+assert(r.status === 'ok' && r.advanced === false, '策略放开后协作编辑者可签认（1/2）')
+assert(release.pendingConfirmFor(editor.id, 'editor').length === 0, '编辑者签认后不再计入其待办')
+r = await release.confirmGate(gM2.id, '', owner)
+assert(r.status === 'ok' && r.advanced === true && r.gate.status === GATE.PENDING_APPROVAL, '第二人签认后推进审批')
+await release.withdrawGate(gM2.id, owner)
+
+// ---------- 17. 影响类型开关：免确认类型自动确认、联动不丢 ----------
+console.log('\n[17] 影响类型开关：免确认类型自动确认且放行联动保留')
+await release.savePolicy({ confirmQuorum: 1, requireOwner: false, allowEditorConfirm: false, watchCitation: true, watchTicket: false, watchShare: false, driftReconfirm: true }, admin)
+const dT = await mkDoc()
+await saveVersion(dT.id, { body: '<p>类型开关 新内容 鉴权</p>' }, owner)
+const citT = await mkCitation(dT.id, '类型开关引用问题?', 1)
+await mkResolvedGap(dT.id, '类型开关工单?')
+const shareT = await mkShare(dT.id, 'view')
+r = await release.submitGate({ docId: dT.id }, owner)
+const gT = r.gate
+const citIt = gT.impacts.find((it) => it.type === 'citation')
+const ticketIt = gT.impacts.find((it) => it.type === 'ticket')
+const shareIt = gT.impacts.find((it) => it.type === 'share')
+assert(citIt.status === 'pending', '纳入确认流的引用仍需逐项确认')
+assert(ticketIt.status === 'confirmed' && ticketIt.autoByPolicy === true, '未纳入确认流的工单影响建档即自动确认')
+assert(shareIt.status === 'confirmed' && shareIt.autoByPolicy === true, '未纳入确认流的链接影响建档即自动确认')
+await release.confirmImpact(gT.id, citIt.key, owner)
+r = await release.confirmGate(gT.id, '', owner)
+assert(r.status === 'ok' && r.gate.status === GATE.PENDING_APPROVAL, '免确认类型不阻塞整体确认')
+r = await release.decideGate(gT.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '放行成功')
+const shareTAfter = await db.shares.get(shareT.id)
+assert(shareTAfter.gateId === gT.id && shareTAfter.gateVersion === 2, '免确认共享链接仍随发布同步（联动不丢）')
+assert((await db.qaCitations.get(citT.id)).docVersion === 2, '引用切换到新版')
+
+// ---------- 18. 版本漂移检测：确认/放行前重扫，漂移即合并重置 ----------
+console.log('\n[18] 版本漂移检测：影响集合漂移合并与签认重置')
+await release.savePolicy({ confirmQuorum: 1, requireOwner: false, allowEditorConfirm: false, watchCitation: true, watchTicket: true, watchShare: true, driftReconfirm: true }, admin)
+// 纯函数：diff / merge
+{
+  const base = normalizeImpacts([{ type: 'share', refId: 's1', title: '链接', before: { revokedAt: null, revokeReason: null } }])
+  const cur = normalizeImpacts([{ type: 'share', refId: 's1', title: '链接', before: { revokedAt: '2026-01-01', revokeReason: 'x' } }])
+  const dd = diffImpacts(cur, base)
+  assert(dd.has && dd.changed.length === 1 && !dd.added.length && !dd.removed.length, '纯函数：识别影响项状态漂移（changed）')
+  const mg = mergeDriftedImpacts(base, cur, DEFAULT_RELEASE_POLICY, nowIso())
+  assert(mg.impacts.length === 1 && mg.impacts[0].status === 'pending' && mg.changed.length === 1, '纯函数：漂移项重置为待确认')
+  assert(diffImpacts([], base).removed.length === 1, '纯函数：识别影响项失效（removed）')
+  assert(diffImpacts(cur, base).has && !diffImpacts(base, base).has, '纯函数：无漂移时不误判')
+}
+const dD = await mkDoc()
+await saveVersion(dD.id, { body: '<p>漂移检测 新内容</p>' }, owner)
+const citD = await mkCitation(dD.id, '漂移前问题?', 1)
+const shareD = await mkShare(dD.id, 'view')
+r = await release.submitGate({ docId: dD.id }, owner)
+const gD = r.gate
+for (const it of gD.impacts) await release.confirmImpact(gD.id, it.key, owner)
+// 流转期间：新提问产生引用（added）、共享链接被撤销（removed）
+await mkCitation(dD.id, '漂移期间的新问题?', 1)
+await share.revokeShare(shareD.id, owner)
+r = await release.confirmGate(gD.id, '', owner)
+assert(r.status === 'drift', '确认时检测到影响漂移（drift）')
+const gD2 = release.gateById(gD.id)
+assert(gD2.status === GATE.PENDING_CONFIRM, '漂移后门禁停留影响确认环节')
+assert(gD2.impacts.some((it) => it.title === '漂移期间的新问题?' && it.status === 'pending'), '漂移新增引用补录为待确认')
+assert(!gD2.impacts.some((it) => it.type === 'share'), '已撤销共享链接的影响项剔除')
+assert(gD2.impacts.find((it) => it.refId === citD.id).status === 'confirmed', '未漂移影响项保留确认态')
+assert(gD2.confirmations.length === 0, '漂移后签认记录清空')
+assert(gD2.timeline.some((t) => t.action === 'impact-drift'), '漂移留痕写入门禁时间线')
+// 重新确认新增项 → 推进
+for (const it of gD2.impacts.filter((i) => i.status === 'pending')) await release.confirmImpact(gD.id, it.key, owner)
+r = await release.confirmGate(gD.id, '', owner)
+assert(r.status === 'ok' && r.gate.status === GATE.PENDING_APPROVAL, '漂移处置后重新确认推进审批')
+// 审批期间再次漂移（新增引用）→ 放行被弹回影响确认
+await mkCitation(dD.id, '审批期间又提问?', 1)
+r = await release.decideGate(gD.id, 'approve', '', admin)
+assert(r.status === 'drift' && r.gate.status === GATE.PENDING_CONFIRM, '放行前漂移检测弹回影响确认')
+const gD3 = release.gateById(gD.id)
+for (const it of gD3.impacts.filter((i) => i.status === 'pending')) await release.confirmImpact(gD.id, it.key, owner)
+r = await release.confirmGate(gD.id, '', owner)
+assert(r.status === 'ok' && r.gate.status === GATE.PENDING_APPROVAL, '再次确认推进')
+r = await release.decideGate(gD.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '漂移处置完成后放行成功')
+const allCits = await db.qaCitations.where('docId').equals(dD.id).toArray()
+assert(allCits.every((c) => c.docVersion === 2), '放行后全部引用（含漂移新增）切换到 v2')
+
+// ---------- 19. 回退恢复与历史留痕一致：多人签认随重新发起恢复 ----------
+console.log('\n[19] 回退恢复：多人签认与影响确认随重新发起恢复，历史留痕一致')
+await release.savePolicy({ confirmQuorum: 2, requireOwner: false, allowEditorConfirm: false, watchCitation: true, watchTicket: true, watchShare: true, driftReconfirm: true }, admin)
+const dR = await mkDoc()
+await saveVersion(dR.id, { body: '<p>回退恢复 v2 内容</p>' }, owner)
+await mkCitation(dR.id, '回退恢复引用?', 1)
+r = await release.submitGate({ docId: dR.id }, owner)
+const gR = r.gate
+for (const it of gR.impacts) await release.confirmImpact(gR.id, it.key, owner)
+r = await release.confirmGate(gR.id, '', owner)
+assert(r.status === 'ok' && r.advanced === false, 'quorum=2 下第一人签认不推进')
+r = await release.confirmGate(gR.id, '', admin)
+assert(r.status === 'ok' && r.advanced === true, '第二人签认推进')
+r = await release.decideGate(gR.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '放行成功')
+r = await release.rollbackGate(gR.id, '回退验证', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.ROLLED_BACK, '回退成功')
+assert(release.gateById(gR.id).confirmations.length === 2, '回退后终态门禁保留两人签认留痕')
+// 重新发起：签认与影响确认一并恢复
+await saveVersion(dR.id, { body: '<p>回退后再发布 v3 内容</p>' }, owner)
+r = await release.submitGate({ docId: dR.id }, owner)
+const gR2 = r.gate
+assert(gR2.restoredFromGateId === gR.id, '新门禁记录恢复来源为上轮门禁')
+assert(gR2.confirmations.length === 2 && gR2.confirmations.every((c) => c.restored), '上轮两人签认自动恢复')
+assert(gR2.impacts.every((it) => it.status === 'confirmed'), '上轮影响确认一并恢复')
+assert(gR2.timeline.some((t) => t.action === 'confirm-restore') && gR2.timeline.some((t) => t.action === 'impact-restore'), '签认与影响恢复均留痕')
+// 恢复已满足 quorum：任一有资格者整体确认即推进
+r = await release.confirmGate(gR2.id, '', owner)
+assert(r.status === 'ok' && r.advanced === true && r.gate.status === GATE.PENDING_APPROVAL, '恢复签认满足 quorum，直接推进审批')
+r = await release.decideGate(gR2.id, 'approve', '', admin)
+assert(r.status === 'ok' && r.gate.status === GATE.RELEASED, '恢复链路放行成功')
+// 历史留痕一致：旧门禁不被新门禁改写
+const gRHist = release.gateById(gR.id)
+assert(gRHist.status === GATE.ROLLED_BACK && gRHist.confirmations.length === 2 && gRHist.impacts.every((it) => it.status === 'reverted'), '历史门禁留痕完整（回退态 + 两人签认 + 影响还原记录）')
+// 恢复默认策略，避免影响其他回归
+await release.savePolicy({ confirmQuorum: 1, requireOwner: false, allowEditorConfirm: false, watchCitation: true, watchTicket: true, watchShare: true, driftReconfirm: true }, admin)
 
 console.log(`\n结果：${passed} 通过，${failed} 失败`)
 process.exit(failed ? 1 : 0)

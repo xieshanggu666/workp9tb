@@ -1,13 +1,16 @@
-// 知识变更影响评估与发布门禁：状态常量、统一治理状态机、门禁/发布判定、影响项状态、权限判定与留痕工具（均为纯函数，便于测试）
+// 知识变更影响评估与发布门禁：状态常量、统一治理状态机、门禁/发布判定、影响项状态、
+// 可配置影响确认流（策略）、版本漂移检测、多人确认、权限判定与留痕工具（均为纯函数，便于测试）
 // 流程：编辑者保存新版本后发起门禁 →
 // 统一治理状态机先对四个维度做准入检查（评审结论 / 知识保鲜 / 未解决缺口 / 退役关系）：
 //   全部通过 → 待负责人确认影响（pending_confirm）；存在阻断 → blocked，阻断原因回写门禁单与关联实体，
 //   责任人可在外部处置后「重新评估」（硬阻断须消除），或对可豁免维度由对应角色跨角色「豁免放行」；
-// 负责人（文档拥有者）逐项确认影响并整体确认 → 管理员审批放行（released：版本发布、引用与链接状态回写）
-// / 驳回（rejected：退回编辑者）→ 已放行版本可由管理员回退（rolled_back：版本回退、引用/链接状态还原）。
+// 确认人按门禁快照策略逐项确认影响并多人签认（quorum 达标且满足负责人必签才推进）→
+// 管理员审批放行（released：版本发布、引用与链接状态回写）/ 驳回（rejected：退回编辑者）→
+// 已放行版本可由管理员回退（rolled_back：版本回退、引用/链接状态还原）。
 // 门禁流转中（blocked / pending_confirm / pending_approval）候选版本不对问答/搜索/共享访问暴露，
 // 对外内容一律为门禁发起时锁定的「已发布版」（doc.release.publishedSnapshot）。
-// 驳回/撤回/回退后重新发起门禁时，上一轮已逐项确认的影响自动恢复确认态（状态恢复）。
+// 版本漂移检测：确认/放行前重新收集影响集合与建档快照比对，新增/移除/变更即合并重置签认并退回确认；
+// 驳回/撤回/回退后重新发起门禁时，上一轮已逐项确认的影响与多人签认自动恢复（状态恢复）。
 import { ROLE, isGuestUser } from './permission'
 import { buildTimelineEntry } from './review'
 import { FRESH, isFreshDue, isFreshnessEnabled, isFreshTicketOpen } from './freshness'
@@ -54,6 +57,77 @@ export const CHECK_DEF = {
   [CHECK_KEY.FRESH]: { label: '知识保鲜', severity: CHECK_SEVERITY.SOFT, roles: [ROLE.ADMIN, 'owner'] },
   [CHECK_KEY.GAP]: { label: '未解决缺口', severity: CHECK_SEVERITY.SOFT, roles: [ROLE.ADMIN, ROLE.EDITOR] },
   [CHECK_KEY.RETIRE]: { label: '退役关系', severity: CHECK_SEVERITY.HARD, roles: [ROLE.ADMIN, 'owner'] }
+}
+
+// ---- 可配置影响确认流策略 ----
+// 全局一条（releasePolicies 表 id='global'），由管理员维护；门禁发起时快照到 gate.policy，
+// 在途/历史门禁始终按发起时规则流转，策略变更不影响既有门禁（历史留痕一致）。
+// - confirmQuorum     整体确认所需的签认人数（去重，1–5）
+// - requireOwner      是否要求文档负责人必须在签认人之列
+// - allowEditorConfirm 协作编辑者是否可作为签认人（负责人/管理员始终可签认）
+// - watchCitation/Ticket/Share 各类影响是否纳入确认流；未纳入的类型仍随门禁收集与联动回写，
+//   但建档即自动确认（autoByPolicy），不占用确认人精力
+// - driftReconfirm    版本漂移检测：确认/放行前重扫影响集合，漂移即合并重置并退回确认
+export const DEFAULT_RELEASE_POLICY = Object.freeze({
+  confirmQuorum: 1,
+  requireOwner: false,
+  allowEditorConfirm: false,
+  watchCitation: true,
+  watchTicket: true,
+  watchShare: true,
+  driftReconfirm: true
+})
+
+export const POLICY_FIELD_LABELS = {
+  confirmQuorum: '确认人数',
+  requireOwner: '负责人必签',
+  allowEditorConfirm: '协作编辑者可签认',
+  watchCitation: '问答引用纳入确认',
+  watchTicket: '缺口工单纳入确认',
+  watchShare: '共享链接纳入确认',
+  driftReconfirm: '影响漂移检测'
+}
+
+export function policyValueLabel(key, val) {
+  if (key === 'confirmQuorum') return String(val) + ' 人'
+  return val ? '开' : '关'
+}
+
+// 归一化策略（缺省/越界值回退默认；quorum 收敛到 1–5 整数）
+export function normalizeReleasePolicy(p) {
+  const src = p && typeof p === 'object' ? p : {}
+  const q = Number(src.confirmQuorum)
+  return {
+    confirmQuorum: Number.isFinite(q) ? Math.min(5, Math.max(1, Math.round(q))) : DEFAULT_RELEASE_POLICY.confirmQuorum,
+    requireOwner: src.requireOwner === true,
+    allowEditorConfirm: src.allowEditorConfirm === true,
+    watchCitation: src.watchCitation !== false,
+    watchTicket: src.watchTicket !== false,
+    watchShare: src.watchShare !== false,
+    driftReconfirm: src.driftReconfirm !== false
+  }
+}
+
+// 门禁适用的策略：优先门禁快照（历史一致），无快照（旧数据）回退全局默认
+export function gatePolicy(gate) {
+  return normalizeReleasePolicy(gate?.policy)
+}
+
+// 影响类型是否纳入确认流（未纳入的类型建档即自动确认，仍参与放行/回退联动）
+export function isTypeWatched(policy, type) {
+  const p = normalizeReleasePolicy(policy)
+  if (type === IMPACT_TYPE.CITATION) return p.watchCitation
+  if (type === IMPACT_TYPE.TICKET) return p.watchTicket
+  if (type === IMPACT_TYPE.SHARE) return p.watchShare
+  return true
+}
+
+// 按策略落地单个影响项的初始确认态：纳入确认流 → 待确认；未纳入 → 自动确认（标记 autoByPolicy）。
+// 同时重置确认痕迹（漂移合并重建影响项时复用）。
+export function applyPolicyToImpact(item, policy, now = new Date().toISOString()) {
+  const base = { ...item, status: IMPACT.PENDING, confirmedBy: null, confirmedAt: null, result: null }
+  if (isTypeWatched(policy, item.type)) return base
+  return { ...base, status: IMPACT.CONFIRMED, confirmedBy: 'system', confirmedAt: now, autoByPolicy: true }
 }
 
 // 影响项类型
@@ -459,11 +533,45 @@ export function canSubmitGate(doc, ctx = {}) {
   return ctx.canEditDoc === true
 }
 
-// 负责人确认影响：文档拥有者本人或管理员；门禁须处于「待负责人确认」（阻断态不可确认）
+// 确认影响/签认资格：文档拥有者本人或管理员始终可确认；门禁快照策略放开
+// allowEditorConfirm 时，文档协作编辑者也可作为签认人；门禁须处于「待负责人确认」（阻断态不可确认）
 export function canConfirmGate(gate, doc, userId, role) {
   if (!isGatePendingConfirm(gate) || isGuestUser(userId)) return false
   if (role === ROLE.ADMIN) return true
-  return !!doc && doc.ownerId === userId
+  const ownerId = doc?.ownerId ?? gate.ownerId
+  if (ownerId && ownerId === userId) return true
+  if (gatePolicy(gate).allowEditorConfirm && Array.isArray(doc?.editors) && doc.editors.includes(userId)) return true
+  return false
+}
+
+// ---- 多人确认（签认） ----
+
+// 门禁的签认列表。旧数据无 confirmations 字段时由 confirmedBy/confirmedAt 推导（历史一致）
+export function confirmationsOf(gate) {
+  if (Array.isArray(gate?.confirmations)) return gate.confirmations
+  if (gate?.confirmedBy) return [{ by: gate.confirmedBy, role: null, note: '', at: gate.confirmedAt || null }]
+  return []
+}
+
+// 该用户是否已在本轮签认（去重判定；恢复的上轮签认同样计入）
+export function hasConfirmed(gate, userId) {
+  return !!userId && confirmationsOf(gate).some((c) => c.by === userId)
+}
+
+// 多人确认进度：{ count, quorum, ownerConfirmed, needOwner, satisfied }
+// satisfied = 签认人数达 quorum 且（若策略要求）负责人已在签认人之列
+export function confirmationProgress(gate, doc) {
+  const policy = gatePolicy(gate)
+  const list = confirmationsOf(gate)
+  const ownerId = doc?.ownerId ?? gate?.ownerId ?? null
+  const ownerConfirmed = !!ownerId && list.some((c) => c.by === ownerId)
+  return {
+    count: list.length,
+    quorum: policy.confirmQuorum,
+    ownerConfirmed,
+    needOwner: policy.requireOwner && !ownerConfirmed,
+    satisfied: list.length >= policy.confirmQuorum && (!policy.requireOwner || ownerConfirmed)
+  }
 }
 
 // 编辑者撤回门禁：发起人本人（或管理员）；门禁仍在流转中（阻断/确认前/待审批均可撤回）
@@ -622,6 +730,70 @@ export function impactCounts(impacts) {
   return c
 }
 
+// ---- 版本漂移检测 ----
+// 门禁建档时的影响集合是确认/签认的基准；流转期间关联实体可能变化
+// （新提问产生引用、共享链接撤销/过期、工单状态变化等），导致已确认结论失效。
+// 确认/放行前以事务内实时收集结果为准做 diff，漂移即合并重置并退回确认环节。
+
+// 影响项指纹：类型 + 实体 + 建档时状态快照（引用版本 / 工单状态 / 链接撤销状态）
+export function impactFingerprint(it) {
+  return it.type + '|' + it.refId + '|' + JSON.stringify(it.before || null)
+}
+
+// 影响集合 diff（current 为实时收集结果，existing 为门禁建档快照）：
+// added 新增关联 / removed 关联失效 / changed 同实体状态漂移；has 表示存在任意漂移
+export function diffImpacts(current = [], existing = []) {
+  const curByKey = new Map((current || []).map((it) => [it.key, it]))
+  const oldByKey = new Map((existing || []).map((it) => [it.key, it]))
+  const added = (current || []).filter((it) => !oldByKey.has(it.key))
+  const removed = (existing || []).filter((it) => !curByKey.has(it.key))
+  const changed = (current || []).filter((it) => {
+    const old = oldByKey.get(it.key)
+    return !!old && impactFingerprint(old) !== impactFingerprint(it)
+  })
+  return { added, removed, changed, has: added.length + removed.length + changed.length > 0 }
+}
+
+// 漂移合并：以实时集合为准重建影响列表——
+// 新增项补录（按策略落地确认态）、变更项重置确认痕迹、未漂移项保留原确认状态、移除项剔除。
+// 返回 { impacts, added, removed, changed }（不修改入参）
+export function mergeDriftedImpacts(existing, current, policy, now = new Date().toISOString()) {
+  const pol = normalizeReleasePolicy(policy)
+  const oldByKey = new Map((existing || []).map((it) => [it.key, it]))
+  const curKeys = new Set((current || []).map((it) => it.key))
+  const impacts = []
+  const added = []
+  const changed = []
+  for (const cur of current || []) {
+    const old = oldByKey.get(cur.key)
+    if (!old) {
+      const item = applyPolicyToImpact(cur, pol, now)
+      impacts.push(item)
+      added.push(item)
+      continue
+    }
+    if (impactFingerprint(old) !== impactFingerprint(cur)) {
+      const item = applyPolicyToImpact(cur, pol, now)
+      impacts.push(item)
+      changed.push(item)
+      continue
+    }
+    impacts.push(old)
+  }
+  const removed = (existing || []).filter((it) => !curKeys.has(it.key))
+  return { impacts, added, removed, changed }
+}
+
+// 漂移摘要（留痕文案）：列出新增/移除/变更的项数与代表标题
+export function driftSummaryNote(drift) {
+  const titles = (list) => list.slice(0, 2).map((it) => '《' + (it.title || it.refId) + '》').join('、') + (list.length > 2 ? ' 等' : '')
+  const parts = []
+  if (drift.added?.length) parts.push('新增 ' + drift.added.length + ' 项（' + titles(drift.added) + '）')
+  if (drift.removed?.length) parts.push('失效 ' + drift.removed.length + ' 项（' + titles(drift.removed) + '）')
+  if (drift.changed?.length) parts.push('变更 ' + drift.changed.length + ' 项（' + titles(drift.changed) + '）')
+  return '影响集合漂移：' + (parts.join('；') || '无明细')
+}
+
 // ---- 问答引用影响推荐（提交门禁时自动勾选）----
 // 以问题关键词对目标文档打分，命中（score>0）即视为「本次版本变更可能影响到的问答引用」。
 // scoreDoc 由调用方注入（复用 utils/qa.scoreDoc），避免本模块依赖检索实现
@@ -669,8 +841,12 @@ export function gateTimelineLabel(action) {
     'check-clear': '阻断消除 · 进入影响确认',
     'check-signoff': '责任人豁免阻断维度',
     'impact-restore': '重新发起 · 恢复上轮已确认影响',
+    'confirm-restore': '重新发起 · 恢复上轮签认',
     'impact-confirm-item': '逐项确认影响',
+    'confirm-add': '多人确认 · 签认影响',
     'impact-confirm-all': '整体确认影响',
+    'impact-drift': '影响漂移检测 · 重置确认',
+    'policy-update': '影响确认流策略变更',
     approve: '管理员审批放行',
     'approve-stale': '放行被阻止：候选版本已落后于最新版本',
     reject: '管理员审批驳回',

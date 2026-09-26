@@ -9,7 +9,9 @@ import { formatDate, formatFull } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
   impactTypeLabel, impactStatusLabel, impactCounts, IMPACT,
-  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, rollbackConflictReason
+  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, rollbackConflictReason,
+  canConfirmGate, hasConfirmed, confirmationProgress, gatePolicy, confirmationsOf,
+  normalizeReleasePolicy
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -24,11 +26,36 @@ const decideNoteMap = ref({})
 const rollbackNoteMap = ref({})
 const waiverNoteMap = ref({})
 const busyId = ref('')
+const showPolicy = ref(false)
+const policyForm = ref(normalizeReleasePolicy(null))
 
 const isAdmin = computed(() => auth.user?.role === 'admin')
 const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
 const userName = (id) => (id === 'system' ? '系统' : userById.value[id]?.name || id)
+
+// 可配置影响确认流策略（全局；门禁发起时快照，历史门禁按发起时规则流转）
+const currentPolicy = computed(() => normalizeReleasePolicy(releaseStore.policy))
+const policySummary = computed(() => {
+  const p = currentPolicy.value
+  return '需 ' + p.confirmQuorum + ' 人签认'
+    + (p.requireOwner ? ' · 负责人必签' : '')
+    + (p.allowEditorConfirm ? ' · 协作编辑者可签' : '')
+    + ' · 漂移检测' + (p.driftReconfirm ? '开' : '关')
+})
+async function savePolicy() {
+  const res = await releaseStore.savePolicy(policyForm.value, auth.user)
+  if (res.status === 'ok') alert(res.changed ? '策略已保存，新发起的门禁将按新策略流转（在途/历史门禁仍按各自快照）。' : '策略无变化。')
+  else alert('只有管理员可以配置影响确认流策略。')
+}
+
+// 当前用户对该门禁是否有签认/逐项确认资格（按门禁快照策略）
+function canConfirmMe(g) {
+  return !!auth.user && canConfirmGate(g, docById.value[g.docId] || null, auth.user.id, auth.user.role)
+}
+function signProgress(g) {
+  return confirmationProgress(g, docById.value[g.docId] || null)
+}
 
 function roleCtxOf(g) {
   return {
@@ -44,11 +71,11 @@ function canRecheck(g) {
   return canRecheckGate(g, roleCtxOf(g))
 }
 
-// 待我处理：阻断态中可处置（重新评估/豁免）的门禁 + 待负责人确认 + 待管理员审批
+// 待我处理：阻断态中可处置（重新评估/豁免）的门禁 + 待签认（按策略有资格且未签认）+ 待管理员审批
 const todoList = computed(() =>
   releaseStore.sorted.filter((g) => {
     if (g.status === GATE.PENDING_APPROVAL) return isAdmin.value
-    if (g.status === GATE.PENDING_CONFIRM) return isAdmin.value || g.ownerId === auth.user?.id
+    if (g.status === GATE.PENDING_CONFIRM) return !hasConfirmed(g, auth.user?.id) && canConfirmMe(g)
     if (g.status === GATE.BLOCKED) return canRecheck(g) || (g.checks || []).some((c) => canWaiver(g, c))
     return false
   })
@@ -109,14 +136,18 @@ async function waiver(g, c) {
 
 async function confirmItem(g, key) {
   const res = await releaseStore.confirmImpact(g.id, key, auth.user)
-  if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+  if (res.status === 'denied') alert('你没有该门禁的影响确认资格（负责人/管理员，或策略放开的协作编辑者）。')
 }
 
 async function confirmAll(g) {
   if (g.impacts.some((it) => it.status === IMPACT.PENDING)) { alert('仍有影响项未逐项确认。'); return }
   const res = await releaseStore.confirmGate(g.id, (confirmNoteMap.value[g.id] || '').trim(), auth.user)
-  if (res.status === 'ok') confirmNoteMap.value[g.id] = ''
-  else if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+  if (res.status === 'ok') {
+    confirmNoteMap.value[g.id] = ''
+    if (!res.advanced) alert('已记录你的签认（' + res.progress.count + '/' + res.progress.quorum + '），待满足确认人数与负责人必签要求后提交审批。')
+  }
+  else if (res.status === 'drift') alert('检测到影响漂移：关联的问答引用/缺口工单/共享链接在流转期间发生变化，影响项与签认已重置，请重新确认。')
+  else if (res.status === 'denied') alert('你没有该门禁的影响确认资格。')
 }
 
 async function withdraw(g) {
@@ -134,6 +165,7 @@ async function decide(g, decision) {
     else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
     else if (res.status === 'blocked') alert('放行前复检发现新阻断，门禁已退回阻断态，请处置后再次送审。')
     else if (res.status === 'stale') alert('放行被阻止：候选 v' + g.version + ' 已不是最新版本（门禁期间产生了并发修改）。请撤回门禁，基于最新版本重新发起。')
+    else if (res.status === 'drift') alert('放行前检测到影响漂移，影响项与签认已重置，门禁退回影响确认环节。')
     else alert('操作失败：门禁状态已变化')
   } finally {
     busyId.value = ''
@@ -173,6 +205,7 @@ function impactIcon(type) {
 
 onMounted(async () => {
   await Promise.all([releaseStore.loadAll(), kb.loadAll()])
+  policyForm.value = { ...currentPolicy.value }
 })
 </script>
 
@@ -180,13 +213,40 @@ onMounted(async () => {
   <div class="gc-page">
     <header class="head">
       <h2>🚦 发布门禁</h2>
-      <p class="sub">统一治理状态机：评审结论、知识保鲜、未解决缺口、退役关系四维度准入 → 跨角色处置/豁免 → 负责人确认影响 → 管理员审批放行或回退，阻断原因自动回写，重新发布时恢复历史确认状态。</p>
+      <p class="sub">统一治理状态机：评审结论、知识保鲜、未解决缺口、退役关系四维度准入 → 跨角色处置/豁免 → 可配置影响确认流（多人签认 + 版本漂移检测）→ 管理员审批放行或回退，阻断原因自动回写，重新发布时恢复历史确认与签认。</p>
       <div class="tabs">
         <button :class="{ on: tab === 'todo' }" @click="tab = 'todo'">待我处理 <em>{{ counts.todo }}</em></button>
         <button :class="{ on: tab === 'mine' }" @click="tab = 'mine'">我提交的 <em>{{ counts.mine }}</em></button>
         <button :class="{ on: tab === 'all' }" @click="tab = 'all'">全部记录 <em>{{ counts.all }}</em></button>
       </div>
     </header>
+
+    <!-- 影响确认流策略（管理员配置；随门禁快照，历史门禁按发起时规则流转） -->
+    <section v-if="isAdmin" class="policy card">
+      <div class="pol-head" @click="showPolicy = !showPolicy">
+        <span class="pol-title">⚙️ 影响确认流策略</span>
+        <span class="pol-summary">{{ policySummary }}</span>
+        <span class="pol-toggle">{{ showPolicy ? '收起 ▲' : '配置 ▼' }}</span>
+      </div>
+      <div v-if="showPolicy" class="pol-body">
+        <label class="pol-field">
+          确认人数
+          <select v-model.number="policyForm.confirmQuorum">
+            <option v-for="n in 5" :key="n" :value="n">{{ n }} 人签认</option>
+          </select>
+        </label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.requireOwner" /> 负责人必须签认</label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.allowEditorConfirm" /> 协作编辑者可签认</label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.watchCitation" /> 问答引用纳入确认</label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.watchTicket" /> 缺口工单纳入确认</label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.watchShare" /> 共享链接纳入确认</label>
+        <label class="pol-field"><input type="checkbox" v-model="policyForm.driftReconfirm" /> 影响漂移检测（确认/放行前重扫影响集合）</label>
+        <div class="pol-acts">
+          <button class="btn sm primary" @click="savePolicy">保存策略</button>
+          <span class="pol-tip">策略随门禁快照生效：在途/历史门禁仍按发起时规则流转，策略变更全程留痕。</span>
+        </div>
+      </div>
+    </section>
 
     <div v-if="!list.length" class="empty card">
       <div class="ico">🚦</div>
@@ -210,7 +270,10 @@ onMounted(async () => {
           <span>{{ userName(g.submittedBy) }} 提交</span>
           <span class="g-ver">v{{ g.publishedVersion }} → v{{ g.version }}</span>
           <span v-if="changedFields(g).length" class="g-fields">变更：{{ fieldLabels(changedFields(g)).join('、') }}</span>
-          <span v-if="g.confirmedAt" class="g-confirmed">负责人 {{ userName(g.confirmedBy) }} 已确认</span>
+          <span v-if="[GATE.PENDING_CONFIRM, GATE.PENDING_APPROVAL].includes(g.status)" class="g-sign">
+            签认 {{ signProgress(g).count }}/{{ gatePolicy(g).confirmQuorum }}<template v-if="confirmationsOf(g).length">（<template v-for="(c, i) in confirmationsOf(g)" :key="c.by">{{ i ? '、' : '' }}{{ userName(c.by) }}</template>）</template>
+          </span>
+          <span v-if="g.confirmedAt" class="g-confirmed">{{ userName(g.confirmedBy) }} 完成确认</span>
           <span v-if="g.decidedAt" class="g-decided">{{ userName(g.decidedBy) }} 于 {{ formatFull(g.decidedAt) }} {{ gateStatusLabel(g.status) }}</span>
         </div>
         <div v-if="g.note" class="g-note">变更说明：“{{ g.note }}”</div>
@@ -268,9 +331,9 @@ onMounted(async () => {
                 <span v-if="it.subtitle">{{ it.subtitle }}</span>
               </div>
             </div>
-            <span class="im-state">{{ impactStatusLabel(it.status) }}</span>
+            <span class="im-state">{{ it.autoByPolicy ? '按策略免确认' : impactStatusLabel(it.status) }}</span>
             <button
-              v-if="g.status === GATE.PENDING_CONFIRM && (isAdmin || g.ownerId === auth.user?.id) && it.status === IMPACT.PENDING"
+              v-if="g.status === GATE.PENDING_CONFIRM && canConfirmMe(g) && it.status === IMPACT.PENDING"
               class="btn xs"
               @click="confirmItem(g, it.key)"
             >确认</button>
@@ -278,10 +341,10 @@ onMounted(async () => {
         </div>
 
         <!-- 操作区 -->
-        <div v-if="g.status === GATE.PENDING_CONFIRM && (isAdmin || g.ownerId === auth.user?.id)" class="acts">
+        <div v-if="g.status === GATE.PENDING_CONFIRM && canConfirmMe(g)" class="acts">
           <textarea :value="confirmNoteMap[g.id] || ''" rows="2" placeholder="影响确认意见（可选）" @input="confirmNoteMap[g.id] = $event.target.value"></textarea>
           <div class="act-row">
-            <button class="btn sm ok-solid" @click="confirmAll(g)">确认影响并提交审批</button>
+            <button class="btn sm ok-solid" @click="confirmAll(g)">{{ hasConfirmed(g, auth.user?.id) ? '重新提交确认' : (gatePolicy(g).confirmQuorum > 1 ? '签认影响' : '确认影响并提交审批') }}</button>
             <button v-if="g.submittedBy === auth.user?.id || isAdmin" class="btn sm ghost" @click="withdraw(g)">撤回升版</button>
           </div>
         </div>
@@ -350,8 +413,21 @@ onMounted(async () => {
 .g-info { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-2); }
 .g-ver { font-weight: 600; color: var(--primary); }
 .g-fields { color: var(--text-3); font-size: 12px; }
+.g-sign { color: #4338ca; font-size: 12px; }
 .g-confirmed { color: #4338ca; font-size: 12px; }
 .g-decided { color: var(--text-3); font-size: 12px; }
+
+/* 影响确认流策略配置 */
+.policy { margin-top: 14px; padding: 10px 16px; }
+.pol-head { display: flex; align-items: center; gap: 12px; cursor: pointer; }
+.pol-title { font-weight: 600; font-size: 13px; }
+.pol-summary { flex: 1; font-size: 12px; color: var(--text-3); }
+.pol-toggle { font-size: 12px; color: var(--primary); }
+.pol-body { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+.pol-field { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text-2); }
+.pol-field select { border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12.5px; background: var(--panel); }
+.pol-acts { display: flex; align-items: center; gap: 12px; margin-top: 4px; }
+.pol-tip { font-size: 12px; color: var(--text-3); }
 .g-note { margin-top: 8px; font-size: 13px; color: var(--text-2); background: var(--panel-2); border-radius: 8px; padding: 8px 12px; }
 
 /* 准入检查 */

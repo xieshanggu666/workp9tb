@@ -121,6 +121,14 @@ export class KnowledgeDB extends Dexie {
       releaseGates: 'id, status, docId, submittedBy, ownerId, version, createdAt, confirmedAt, decidedAt',
       qaCitations: 'id, docId, askedBy, createdAt, gateId'
     })
+    // v15：可配置影响确认流
+    // - releasePolicies：发布门禁影响确认流策略（全局一条 id='global'，管理员维护）——
+    //   确认人数 quorum、负责人必签、协作编辑者可签认、各影响类型是否纳入确认、影响漂移检测开关；
+    //   门禁发起时把策略快照到 gate.policy，在途/历史门禁始终按发起时规则流转（历史留痕一致），
+    //   策略变更记录于策略自身 timeline。门禁单上的多人签认（confirmations）随记录读写，不单独建索引。
+    this.version(15).stores({
+      releasePolicies: 'id, updatedAt'
+    })
   }
 }
 

@@ -8,7 +8,8 @@ import { formatFull, formatDate } from '@/utils/format'
 import {
   GATE, gateStatusLabel, gateStatusCls, gateTimelineLabel,
   impactTypeLabel, impactStatusLabel, IMPACT,
-  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, allChecksCleared
+  CHECK_SEVERITY, canSignOffCheck, canRecheckGate, allChecksCleared,
+  canConfirmGate, gatePolicy, confirmationsOf, hasConfirmed, confirmationProgress
 } from '@/utils/release'
 import { diffVersionFields, fieldLabels } from '@/utils/version'
 
@@ -53,8 +54,14 @@ const canSubmit = computed(() => {
   return versions.length > 1
 })
 
-const isOwner = computed(() => props.doc.ownerId === auth.user?.id || auth.user?.role === 'admin')
 const isAdmin = computed(() => auth.user?.role === 'admin')
+
+// 可配置影响确认流：在途门禁的策略快照、签认进度与当前用户资格
+const openPolicy = computed(() => gatePolicy(openGate.value))
+const openConfs = computed(() => confirmationsOf(openGate.value))
+const openProgress = computed(() => confirmationProgress(openGate.value, props.doc))
+const canConfirmMe = computed(() => !!auth.user && !!openGate.value && canConfirmGate(openGate.value, props.doc, auth.user.id, auth.user.role))
+const hasConfirmedMe = computed(() => hasConfirmed(openGate.value, auth.user?.id))
 
 function roleCtx() {
   return { userId: auth.user?.id, role: auth.user?.role, isOwner: props.doc.ownerId === auth.user?.id }
@@ -125,7 +132,7 @@ async function waiver(g, check) {
 
 async function confirmItem(key) {
   const res = await releaseStore.confirmImpact(openGate.value.id, key, auth.user)
-  if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+  if (res.status === 'denied') alert('你没有该门禁的影响确认资格（负责人/管理员，或策略放开的协作编辑者）。')
 }
 
 async function confirmAll() {
@@ -135,8 +142,12 @@ async function confirmAll() {
     return
   }
   const res = await releaseStore.confirmGate(g.id, confirmNote.value.trim(), auth.user)
-  if (res.status === 'ok') { confirmNote.value = '' }
-  else if (res.status === 'denied') alert('只有文档负责人或管理员可以确认影响。')
+  if (res.status === 'ok') {
+    confirmNote.value = ''
+    if (!res.advanced) alert('已记录你的签认（' + res.progress.count + '/' + res.progress.quorum + '），待满足确认人数与负责人必签要求后提交审批。')
+  }
+  else if (res.status === 'drift') alert('检测到影响漂移：关联的问答引用/缺口工单/共享链接在流转期间发生变化，影响项与签认已重置，请重新确认。')
+  else if (res.status === 'denied') alert('你没有该门禁的影响确认资格。')
   else if (res.status === 'unconfirmed') alert('仍有影响项未确认。')
 }
 
@@ -152,6 +163,7 @@ async function decide(g, decision) {
   else if (res.status === 'denied' || res.status === 'guest') alert('只有管理员可以审批放行或驳回。')
   else if (res.status === 'blocked') alert('放行前复检发现新的阻断维度，门禁已退回阻断态：\n' + (res.blocking || []).map((b) => '· ' + b.reason).join('\n'))
   else if (res.status === 'stale') alert('放行被阻止：候选 v' + g.version + ' 已不是最新版本（门禁期间产生了并发修改）。请撤回门禁后基于最新版本重新发起。')
+  else if (res.status === 'drift') alert('放行前检测到影响漂移，影响项与签认已重置，门禁退回影响确认环节。')
   else alert('操作失败：门禁状态已变化')
 }
 
@@ -221,11 +233,14 @@ onMounted(() => releaseStore.loadAll())
       </div>
       <div class="go-meta">
         <span>{{ userName(openGate.submittedBy) }} 提交</span>
-        <span v-if="openGate.confirmedAt">负责人 {{ userName(openGate.confirmedBy) }} 已确认影响</span>
+        <span v-if="openConfs.length">已签认 {{ openProgress.count }}/{{ openProgress.quorum }}：<template v-for="(c, i) in openConfs" :key="c.by">{{ i ? '、' : '' }}{{ userName(c.by) }}</template></span>
         <span v-if="openGate.note" class="go-note">“{{ openGate.note }}”</span>
       </div>
       <div v-if="gateChangedFields.length" class="go-fields">
         变更字段：<b>{{ fieldLabels(gateChangedFields).join('、') }}</b>
+      </div>
+      <div v-if="[GATE.PENDING_CONFIRM, GATE.PENDING_APPROVAL].includes(openGate.status)" class="go-policy">
+        确认流：需 {{ openPolicy.confirmQuorum }} 人签认<template v-if="openPolicy.requireOwner"> · 负责人必签</template><template v-if="openPolicy.allowEditorConfirm"> · 协作编辑者可签认</template> · 影响漂移检测{{ openPolicy.driftReconfirm ? '开' : '关' }}
       </div>
 
       <!-- 统一准入检查：四维度状态机 -->
@@ -276,11 +291,11 @@ onMounted(() => releaseStore.loadAll())
               <div class="im-sub">
                 <span class="im-type">{{ impactTypeLabel(it.type) }}</span>
                 <span v-if="it.subtitle">{{ it.subtitle }}</span>
-                <span class="im-state">{{ impactStatusLabel(it.status) }}</span>
+                <span class="im-state">{{ it.autoByPolicy ? '按策略免确认' : impactStatusLabel(it.status) }}</span>
               </div>
             </div>
             <button
-              v-if="openGate.status === GATE.PENDING_CONFIRM && isOwner && it.status === IMPACT.PENDING"
+              v-if="openGate.status === GATE.PENDING_CONFIRM && canConfirmMe && it.status === IMPACT.PENDING"
               class="btn xs"
               @click="confirmItem(it.key)"
             >确认影响</button>
@@ -290,16 +305,22 @@ onMounted(() => releaseStore.loadAll())
           ♻️ 已自动恢复上轮门禁中确认过的 {{ openGate.impacts.filter((it) => it.restoredFromGateId).length }} 项影响结论，可直接整体确认。
         </div>
 
-        <!-- 负责人整体确认 -->
-        <div v-if="openGate.status === GATE.PENDING_CONFIRM && isOwner" class="go-confirm">
+        <!-- 多人确认（可配置确认流：quorum / 负责人必签 / 编辑者可签） -->
+        <div v-if="openGate.status === GATE.PENDING_CONFIRM && canConfirmMe" class="go-confirm">
+          <div class="go-sign-progress">
+            签认进度 {{ openProgress.count }}/{{ openProgress.quorum }}
+            <template v-if="openPolicy.requireOwner">（需负责人签认）</template>
+            <span v-if="openConfs.length" class="go-sign-list">已签认：<template v-for="(c, i) in openConfs" :key="c.by">{{ i ? '、' : '' }}{{ userName(c.by) }}</template></span>
+            <span v-if="hasConfirmedMe" class="go-signed-chip">你已签认</span>
+          </div>
           <textarea v-model="confirmNote" rows="2" placeholder="影响确认意见（可选，提交管理员审批）"></textarea>
           <div class="go-acts">
-            <button class="btn sm ok-solid" @click="confirmAll">确认影响并提交审批</button>
+            <button class="btn sm ok-solid" @click="confirmAll">{{ hasConfirmedMe ? '重新提交确认' : (openProgress.quorum > 1 ? '签认影响（' + (openProgress.count + 1) + '/' + openProgress.quorum + '）' : '确认影响并提交审批') }}</button>
             <button v-if="openGate.submittedBy === auth.user?.id || isAdmin" class="btn sm ghost" @click="withdraw(openGate)">撤回升版</button>
           </div>
         </div>
         <div v-else-if="openGate.status === GATE.PENDING_CONFIRM" class="go-wait">
-          等待文档负责人（{{ userById[openGate.ownerId]?.name || openGate.ownerId }}）确认影响
+          等待确认人签认影响（{{ openProgress.count }}/{{ openProgress.quorum }}<template v-if="openPolicy.requireOwner">，需负责人签认</template>）
           <button v-if="openGate.submittedBy === auth.user?.id" class="btn xs ghost" @click="withdraw(openGate)">撤回</button>
         </div>
 
@@ -377,6 +398,10 @@ onMounted(() => releaseStore.loadAll())
 .go-note { color: var(--text-3); }
 .go-fields { margin-top: 8px; font-size: 12.5px; color: var(--text-2); }
 .go-fields b { color: var(--primary); }
+.go-policy { margin-top: 8px; font-size: 12px; color: var(--text-3); background: var(--panel-2); border-radius: 6px; padding: 4px 10px; display: inline-block; }
+.go-sign-progress { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12.5px; color: var(--text-2); margin-bottom: 8px; }
+.go-sign-list { color: var(--text-3); font-size: 12px; }
+.go-signed-chip { font-size: 11px; background: #dcfce7; color: #15803d; border-radius: 999px; padding: 1px 8px; }
 
 /* 准入检查维度 */
 .checks { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; background: var(--panel); }
